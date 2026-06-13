@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Base classes for Berkeley Humanoid."""
+"""Base class for EROS humanoid robot environments.
+
+The EROS robot exposes only IMU sensors (gyro, accelerometer, velocimeter,
+framezaxis, framelinvel, frameangvel).  There are no dedicated foot-position
+or foot-velocity sensors, so the observation and reward design is adapted
+accordingly.
+"""
 
 from typing import Any, Dict, Optional, Union
 
@@ -28,17 +34,15 @@ from mujoco_playground._src.locomotion.eros import eros_constants as consts
 
 
 def get_assets() -> Dict[str, bytes]:
+  """Return all XML/mesh assets needed to load the EROS model."""
   assets = {}
   mjx_env.update_assets(assets, consts.ROOT_PATH / "xmls", "*.xml")
   mjx_env.update_assets(assets, consts.ROOT_PATH / "xmls" / "assets")
-  path = mjx_env.MENAGERIE_PATH / "eros"
-  mjx_env.update_assets(assets, path, "*.xml")
-  mjx_env.update_assets(assets, path / "assets")
   return assets
 
 
-class erosEnv(mjx_env.MjxEnv):
-  """Base class for eros environments."""
+class ErosEnv(mjx_env.MjxEnv):
+  """Base class for EROS locomotion environments."""
 
   def __init__(
       self,
@@ -59,48 +63,48 @@ class erosEnv(mjx_env.MjxEnv):
     self._mjx_model = mjx.put_model(self._mj_model)
     self._xml_path = xml_path
 
-  # Sensor readings.
+  # ---------------------------------------------------------------------------
+  # IMU sensor readings (all EROS sensors originate from the "imu" site).
+  # ---------------------------------------------------------------------------
 
   def get_gravity(self, data: mjx.Data) -> jax.Array:
-    """Return the gravity vector in the world frame."""
+    """Return the up-vector (z-axis) of the IMU site in world frame.
+
+    A value of [0, 0, 1] means the robot is perfectly upright.
+    """
     return mjx_env.get_sensor_data(self.mj_model, data, consts.GRAVITY_SENSOR)
 
   def get_global_linvel(self, data: mjx.Data) -> jax.Array:
-    """Return the linear velocity of the robot in the world frame."""
+    """Return the linear velocity of the IMU site in the world frame."""
     return mjx_env.get_sensor_data(
         self.mj_model, data, consts.GLOBAL_LINVEL_SENSOR
     )
 
   def get_global_angvel(self, data: mjx.Data) -> jax.Array:
-    """Return the angular velocity of the robot in the world frame."""
+    """Return the angular velocity of the IMU site in the world frame."""
     return mjx_env.get_sensor_data(
         self.mj_model, data, consts.GLOBAL_ANGVEL_SENSOR
     )
 
   def get_local_linvel(self, data: mjx.Data) -> jax.Array:
-    """Return the linear velocity of the robot in the local frame."""
+    """Return the linear velocity of the IMU site in the body (local) frame."""
     return mjx_env.get_sensor_data(
         self.mj_model, data, consts.LOCAL_LINVEL_SENSOR
     )
 
   def get_accelerometer(self, data: mjx.Data) -> jax.Array:
-    """Return the accelerometer readings in the local frame."""
+    """Return raw accelerometer readings from the IMU (body frame)."""
     return mjx_env.get_sensor_data(
         self.mj_model, data, consts.ACCELEROMETER_SENSOR
     )
 
   def get_gyro(self, data: mjx.Data) -> jax.Array:
-    """Return the gyroscope readings in the local frame."""
+    """Return gyroscope (angular rate) readings from the IMU (body frame)."""
     return mjx_env.get_sensor_data(self.mj_model, data, consts.GYRO_SENSOR)
 
-  def get_feet_pos(self, data: mjx.Data) -> jax.Array:
-    """Return the position of the feet in the world frame."""
-    return jp.vstack([
-        mjx_env.get_sensor_data(self.mj_model, data, sensor_name)
-        for sensor_name in consts.FEET_POS_SENSOR
-    ])
-
+  # ---------------------------------------------------------------------------
   # Accessors.
+  # ---------------------------------------------------------------------------
 
   @property
   def xml_path(self) -> str:

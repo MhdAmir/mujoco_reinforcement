@@ -12,3 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""EROS humanoid locomotion environments (IMU-only sensor suite)."""
+
+from mujoco_playground._src.locomotion.eros import eros_constants as constants
+from mujoco_playground._src.locomotion.eros.base import ErosEnv, get_assets
+from mujoco_playground._src.locomotion.eros.joystick import Joystick, default_config
+from mujoco_playground._src.locomotion.eros.randomize import domain_randomize
+
+__all__ = [
+    "constants",
+    "ErosEnv",
+    "get_assets",
+    "Joystick",
+    "default_config",
+    "domain_randomize",
+]

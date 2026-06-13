@@ -12,7 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Joystick task for Berkeley Humanoid."""
+"""Joystick locomotion task for the EROS humanoid robot.
+
+Design notes
+------------
+* The EROS robot has **only IMU sensors** (gyro, accelerometer, velocimeter,
+  framezaxis, framelinvel, frameangvel). There are no dedicated foot-position
+  or foot-velocity sensors.
+* The **policy controls only the 12 leg joints** (r/l hip yaw/roll/pitch,
+  r/l knee pitch, r/l ankle pitch/roll). The arm and head actuators are held
+  at their home positions throughout training.
+* Observations that required foot sensors (feet_vel, feet_clearance,
+  feet_height, feet_phase) are replaced by foot positions derived directly
+  from site_xpos (available in simulation) and by contact / air-time signals
+  that rely only on collision geometry.
+* The reward structure mirrors the Wolfgang Joystick task as closely as
+  possible, but `feet_clearance`, `feet_height`, and `feet_phase` are
+  disabled by default (scale = 0.0) because precise foot-height control
+  without an accurate foot-velocity estimate is ill-conditioned.
+"""
 
 from typing import Any, Dict, Optional, Union
 
@@ -30,6 +48,10 @@ from mujoco_playground._src.locomotion.eros import base as eros_base
 from mujoco_playground._src.locomotion.eros import eros_constants as consts
 
 
+# ---------------------------------------------------------------------------
+# Default hyper-parameters
+# ---------------------------------------------------------------------------
+
 def default_config() -> config_dict.ConfigDict:
   return config_dict.create(
       ctrl_dt=0.02,
@@ -42,41 +64,44 @@ def default_config() -> config_dict.ConfigDict:
       noise_config=config_dict.create(
           level=1.0,  # Set to 0.0 to disable noise.
           scales=config_dict.create(
-              hip_pos=0.03,  # rad
-              kfe_pos=0.05,
-              ffe_pos=0.08,
-              faa_pos=0.03,
-              joint_vel=0.2,  # rad/s
+              # Leg joint position noise (rad).
+              hip_pos=0.03,
+              knee_pos=0.05,
+              ankle_pos=0.08,
+              # Joint velocity noise (rad/s).
+              joint_vel=0.2,
+              # IMU noise.
               gravity=0.05,
               linvel=0.1,
-              gyro=0.2,  # angvel.
+              gyro=0.2,
           ),
       ),
       reward_config=config_dict.create(
           scales=config_dict.create(
-              # Tracking related rewards.
+              # Tracking rewards.
               tracking_lin_vel=1.0,
               tracking_ang_vel=0.5,
-              # Base related rewards.
-              lin_vel_z=0.0,
+              # Base-state rewards.
+              lin_vel_z=-2.0,
               ang_vel_xy=-0.15,
               orientation=-1.0,
               base_height=0.0,
-              # Energy related rewards.
+              # Energy rewards.
               torques=-2.5e-5,
               action_rate=-0.01,
-              energy=-1.e-3,
-              # Feet related rewards.
-              feet_clearance=0.0,
+              energy=-1.0e-3,
+              # Foot rewards (contact/air-time only; no foot-vel sensors).
               feet_air_time=2.0,
               feet_slip=-0.25,
+              # Phase-based rewards – disabled by default without foot sensors.
+              feet_clearance=0.0,
               feet_height=0.0,
               feet_phase=1.0,
               # Other rewards.
               stand_still=0.0,
               alive=0.0,
               termination=-1.0,
-              # Pose related rewards.
+              # Pose rewards.
               joint_deviation_knee=-0.1,
               joint_deviation_hip=-0.25,
               dof_pos_limits=-1.0,
@@ -84,7 +109,7 @@ def default_config() -> config_dict.ConfigDict:
           ),
           tracking_sigma=0.5,
           max_foot_height=0.1,
-          base_height_target=0.4,
+          base_height_target=-0.038,  # EROS base origin z when standing (~feet at ground)
       ),
       push_config=config_dict.create(
           enable=True,
@@ -97,8 +122,16 @@ def default_config() -> config_dict.ConfigDict:
   )
 
 
-class Joystick(eros_base.erosEnv):
-  """Track a joystick command."""
+# ---------------------------------------------------------------------------
+# Joystick task
+# ---------------------------------------------------------------------------
+
+class Joystick(eros_base.ErosEnv):
+  """Track a joystick (vx, vy, wz) command using IMU-only observations.
+
+  The policy outputs residual joint angles for the **12 leg joints** only.
+  Arm/head actuators are commanded to their home position at every step.
+  """
 
   def __init__(
       self,
@@ -113,109 +146,165 @@ class Joystick(eros_base.erosEnv):
     )
     self._post_init()
 
-  def _post_init(self) -> None:
-    self._init_q = jp.array(self._mj_model.keyframe("home").qpos)
-    self._default_pose = jp.array(self._mj_model.keyframe("home").qpos[7:])
+  # -------------------------------------------------------------------------
+  # Action size override: policy controls only the 12 leg joints.
+  # The base class returns self._mjx_model.nu = 20 (all actuators), but
+  # the training framework uses this property to size the action vector,
+  # so we must return 12 here to avoid shape mismatches.
+  # -------------------------------------------------------------------------
 
-    # Note: First joint is freejoint.
-    self._lowers, self._uppers = self.mj_model.jnt_range[1:].T
+  @property
+  def action_size(self) -> int:
+    return consts.NUM_LEG_DOFS  # 12
+
+  # -------------------------------------------------------------------------
+  # Initialisation helpers
+  # -------------------------------------------------------------------------
+
+  def _post_init(self) -> None:
+    # -----------------------------------------------------------------------
+    # Joint address lookup by NAME (robust against body-tree ordering).
+    #
+    # MuJoCo orders joints in qpos/qvel by depth-first body-tree traversal,
+    # NOT by the actuator order in <actuator>.  For the EROS robot the tree
+    # is:  base(free) → neck → head → r_arm(×3) → l_arm(×3) → r_leg(×6)
+    #                                                           → l_leg(×6)
+    # That means leg joints start at qpos[15], NOT qpos[7].
+    # Using named lookups makes this code immune to XML reordering.
+    # -----------------------------------------------------------------------
+    self._leg_qpos_adr = np.array([
+        self._mj_model.joint(name).qposadr for name in consts.LEG_JOINT_NAMES
+    ]).squeeze()
+    self._leg_dof_adr = np.array([
+        self._mj_model.joint(name).dofadr for name in consts.LEG_JOINT_NAMES
+    ]).squeeze()
+
+
+    # Home pose from the keyframe.
+    home_qpos = self._mj_model.keyframe("home").qpos
+    self._init_q = jp.array(home_qpos)
+
+    # Default leg joint targets — read at the CORRECT qpos addresses.
+    self._default_pose = jp.array(home_qpos[self._leg_qpos_adr])
+
+    # Build default ctrl in ACTUATOR order (legs first in the XML, then arms,
+    # then neck/head).  For each actuator we look up its joint's home qpos.
+    home_ctrl = np.zeros(self._mj_model.nu)
+    for i in range(self._mj_model.nu):
+      joint_id = self._mj_model.actuator_trnid[i, 0]
+      qpos_adr = self._mj_model.jnt_qposadr[joint_id]
+      home_ctrl[i] = home_qpos[qpos_adr]
+    self._default_ctrl = jp.array(home_ctrl)
+
+    # Soft joint limits — use the actual leg joint ranges by name.
+    leg_ranges = np.array([
+        self._mj_model.joint(name).range for name in consts.LEG_JOINT_NAMES
+    ])
+    self._lowers, self._uppers = leg_ranges.T
     c = (self._lowers + self._uppers) / 2
     r = self._uppers - self._lowers
     self._soft_lowers = c - 0.5 * r * self._config.soft_joint_pos_limit_factor
     self._soft_uppers = c + 0.5 * r * self._config.soft_joint_pos_limit_factor
 
-    hip_indices = []
-    hip_joint_names = ["hip_yaw", "hip_roll"]
-    for side in ["l", "r"]:
-      for joint_name in hip_joint_names:
-        hip_indices.append(
-            self._mj_model.joint(f"{side}_{joint_name}").qposadr - 7
-        )
-    self._hip_indices = jp.array(hip_indices)
+    # Hip joint indices within the 12-DOF leg vector (actuator order).
+    # r_hip_yaw=0, r_hip_roll=1, l_hip_yaw=6, l_hip_roll=7
+    self._hip_indices = jp.array([0, 1, 6, 7])
 
-    knee_indices = []
-    for side in ["l", "r"]:
-      knee_indices.append(self._mj_model.joint(f"{side}_knee").qposadr - 7)
-    self._knee_indices = jp.array(knee_indices)
+    # Knee joint indices within the 12-DOF leg vector.
+    # r_knee_pitch=3, l_knee_pitch=9
+    self._knee_indices = jp.array([3, 9])
 
+    # Pose deviation  weights for each of the 12 leg joints.
     # fmt: off
     self._weights = jp.array([
-        1.0, 1.0, 0.01, 0.01, 1.0, 1.0,  # left leg.
-        1.0, 1.0, 0.01, 0.01, 1.0, 1.0,  # right leg.
+        1.0, 1.0, 0.01, 0.01, 1.0, 1.0,   # right leg
+        1.0, 1.0, 0.01, 0.01, 1.0, 1.0,   # left leg
     ])
     # fmt: on
 
+    # Body / site IDs.
     self._torso_body_id = self._mj_model.body(consts.ROOT_BODY).id
     self._torso_mass = self._mj_model.body_subtreemass[self._torso_body_id]
-    self._site_id = self._mj_model.site("imu").id
+    self._imu_site_id = self._mj_model.site("imu").id
 
+    # Foot site IDs (for site_xpos lookups → foot height).
     self._feet_site_id = np.array(
         [self._mj_model.site(name).id for name in consts.FEET_SITES]
     )
+
+    # Floor and foot collision geom IDs.
     self._floor_geom_id = self._mj_model.geom("floor").id
     self._feet_geom_id = np.array(
         [self._mj_model.geom(name).id for name in consts.FEET_GEOMS]
     )
 
-    foot_linvel_sensor_adr = []
-    for site in consts.FEET_SITES:
-      sensor_id = self._mj_model.sensor(f"{site}_global_linvel").id
-      sensor_adr = self._mj_model.sensor_adr[sensor_id]
-      sensor_dim = self._mj_model.sensor_dim[sensor_id]
-      foot_linvel_sensor_adr.append(
-          list(range(sensor_adr, sensor_adr + sensor_dim))
-      )
-    self._foot_linvel_sensor_adr = jp.array(foot_linvel_sensor_adr)
-
-    qpos_noise_scale = np.zeros(12)
-    hip_ids = [0, 1, 2, 6, 7, 8]
-    kfe_ids = [3, 9]
-    ffe_ids = [4, 10]
-    faa_ids = [5, 11]
-    qpos_noise_scale[hip_ids] = self._config.noise_config.scales.hip_pos
-    qpos_noise_scale[kfe_ids] = self._config.noise_config.scales.kfe_pos
-    qpos_noise_scale[ffe_ids] = self._config.noise_config.scales.ffe_pos
-    qpos_noise_scale[faa_ids] = self._config.noise_config.scales.faa_pos
+    # Per-joint position noise scale (in leg-actuator order, matching policy).
+    qpos_noise_scale = np.zeros(consts.NUM_LEG_DOFS)
+    hip_ids    = [0, 1, 2, 6, 7, 8]   # yaw, roll, pitch (both sides)
+    knee_ids   = [3, 9]
+    ankle_ids  = [4, 5, 10, 11]
+    qpos_noise_scale[hip_ids]   = self._config.noise_config.scales.hip_pos
+    qpos_noise_scale[knee_ids]  = self._config.noise_config.scales.knee_pos
+    qpos_noise_scale[ankle_ids] = self._config.noise_config.scales.ankle_pos
     self._qpos_noise_scale = jp.array(qpos_noise_scale)
+
+  # -------------------------------------------------------------------------
+  # Reset
+  # -------------------------------------------------------------------------
 
   def reset(self, rng: jax.Array) -> mjx_env.State:
     qpos = self._init_q
     qvel = jp.zeros(self.mjx_model.nv)
 
-    # x=+U(-0.5, 0.5), y=+U(-0.5, 0.5), yaw=U(-3.14, 3.14).
+    # Randomise initial XY position.
     rng, key = jax.random.split(rng)
     dxy = jax.random.uniform(key, (2,), minval=-0.5, maxval=0.5)
     qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
+
+    # Randomise initial yaw.
     rng, key = jax.random.split(rng)
     yaw = jax.random.uniform(key, (1,), minval=-3.14, maxval=3.14)
     quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), yaw)
     new_quat = math.quat_mul(qpos[3:7], quat)
     qpos = qpos.at[3:7].set(new_quat)
 
-    # qpos[7:]=*U(0.5, 1.5)
+    # Randomise initial leg joint angles (*U(0.5, 1.5)).
+    # Use _leg_qpos_adr (named address lookup) to reach the correct qpos slots.
     rng, key = jax.random.split(rng)
-    qpos = qpos.at[7:].set(
-        qpos[7:] * jax.random.uniform(key, (12,), minval=0.5, maxval=1.5)
+    scale = jax.random.uniform(
+        key, (consts.NUM_LEG_DOFS,), minval=0.5, maxval=1.5
+    )
+    qpos = qpos.at[self._leg_qpos_adr].set(
+        qpos[self._leg_qpos_adr] * scale
     )
 
-    # d(xyzrpy)=U(-0.5, 0.5)
+    # Randomise initial base velocity.
     rng, key = jax.random.split(rng)
     qvel = qvel.at[0:6].set(
         jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5)
     )
 
-    data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=qpos[7:])
+    # Initialise full actuator control at home position (leg + arm/head).
+    data = mjx_env.init(
+        self.mjx_model,
+        qpos=qpos,
+        qvel=qvel,
+        ctrl=self._default_ctrl,
+    )
 
-    # Phase, freq=U(1.0, 1.5)
+    # Gait phase initialisation.
     rng, key = jax.random.split(rng)
     gait_freq = jax.random.uniform(key, (1,), minval=1.25, maxval=1.5)
     phase_dt = 2 * jp.pi * self.dt * gait_freq
-    phase = jp.array([0, jp.pi])
+    rng, key = jax.random.split(rng)
+    phase_offset = jax.random.uniform(key, minval=-jp.pi, maxval=jp.pi)
+    phase = jp.array([phase_offset, phase_offset + jp.pi])
+    phase = jp.fmod(phase + jp.pi, 2 * jp.pi) - jp.pi
 
     rng, cmd_rng = jax.random.split(rng)
     cmd = self.sample_command(cmd_rng)
 
-    # Sample push interval.
+    # Push interval.
     rng, push_rng = jax.random.split(rng)
     push_interval = jax.random.uniform(
         push_rng,
@@ -228,16 +317,16 @@ class Joystick(eros_base.erosEnv):
         "rng": rng,
         "step": 0,
         "command": cmd,
-        "last_act": jp.zeros(self.mjx_model.nu),
-        "last_last_act": jp.zeros(self.mjx_model.nu),
-        "motor_targets": jp.zeros(self.mjx_model.nu),
+        "last_act": jp.zeros(consts.NUM_LEG_DOFS),
+        "last_last_act": jp.zeros(consts.NUM_LEG_DOFS),
+        "motor_targets": jp.zeros(consts.NUM_LEG_DOFS),
         "feet_air_time": jp.zeros(2),
         "last_contact": jp.zeros(2, dtype=bool),
         "swing_peak": jp.zeros(2),
-        # Phase related.
+        # Phase.
         "phase_dt": phase_dt,
         "phase": phase,
-        # Push related.
+        # Push.
         "push": jp.array([0.0, 0.0]),
         "push_step": 0,
         "push_interval_steps": push_interval_steps,
@@ -256,7 +345,20 @@ class Joystick(eros_base.erosEnv):
     reward, done = jp.zeros(2)
     return mjx_env.State(data, obs, reward, done, metrics, info)
 
+  # -------------------------------------------------------------------------
+  # Step
+  # -------------------------------------------------------------------------
+
   def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
+    """Advance the simulation by one control step.
+
+    Args:
+      state: Current environment state.
+      action: 12-D residual action for the leg joints.
+
+    Returns:
+      Updated environment state.
+    """
     state.info["rng"], push1_rng, push2_rng = jax.random.split(
         state.info["rng"], 3
     )
@@ -277,12 +379,16 @@ class Joystick(eros_base.erosEnv):
     data = state.data.replace(qvel=qvel)
     state = state.replace(data=data)
 
-    motor_targets = self._default_pose + action * self._config.action_scale
-    data = mjx_env.step(
-        self.mjx_model, state.data, motor_targets, self.n_substeps
-    )
-    state.info["motor_targets"] = motor_targets
+    # --- Leg motor targets (residual from home pose) -------------------------
+    leg_targets = self._default_pose + action * self._config.action_scale
 
+    # Build full actuator command: leg joints first, then arm/head at home.
+    full_ctrl = self._default_ctrl.at[:consts.NUM_LEG_DOFS].set(leg_targets)
+
+    data = mjx_env.step(self.mjx_model, state.data, full_ctrl, self.n_substeps)
+    state.info["motor_targets"] = leg_targets
+
+    # Contact detection.
     contact = jp.array([
         geoms_colliding(data, geom_id, self._floor_geom_id)
         for geom_id in self._feet_geom_id
@@ -290,6 +396,8 @@ class Joystick(eros_base.erosEnv):
     contact_filt = contact | state.info["last_contact"]
     first_contact = (state.info["feet_air_time"] > 0.0) * contact_filt
     state.info["feet_air_time"] += self.dt
+
+    # Track swing peak height from foot sites.
     p_f = data.site_xpos[self._feet_site_id]
     p_fz = p_f[..., -1]
     state.info["swing_peak"] = jp.maximum(state.info["swing_peak"], p_fz)
@@ -334,15 +442,37 @@ class Joystick(eros_base.erosEnv):
     state = state.replace(data=data, obs=obs, reward=reward, done=done)
     return state
 
+  # -------------------------------------------------------------------------
+  # Termination
+  # -------------------------------------------------------------------------
+
   def _get_termination(self, data: mjx.Data) -> jax.Array:
+    """Terminate if the robot falls (up-vector points down) or qpos/qvel NaN."""
     fall_termination = self.get_gravity(data)[-1] < 0.0
     return (
         fall_termination | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
     )
 
+  # -------------------------------------------------------------------------
+  # Observation (IMU-only)
+  # -------------------------------------------------------------------------
+
   def _get_obs(
       self, data: mjx.Data, info: dict[str, Any], contact: jax.Array
   ) -> mjx_env.Observation:
+    """Build the observation dictionary.
+
+    ``state`` (policy input):
+      gyro (3) + gravity (3) + command (3) + joint_angles (12) +
+      joint_vel (12) + last_action (12) + gait_phase (4) = 49-D
+
+    ``privileged_state`` (teacher / critic input):
+      state (49) + gyro_clean (3) + accel (3) + gravity_clean (3) +
+      linvel_clean (3) + global_angvel (3) + joint_angles_clean (12) +
+      joint_vel_clean (12) + root_height (1) + actuator_force (12) +
+      contact (2) + feet_air_time (2) + foot_height (2) = 109-D
+    """
+    # --- Noisy gyro ---
     gyro = self.get_gyro(data)
     info["rng"], noise_rng = jax.random.split(info["rng"])
     noisy_gyro = (
@@ -352,7 +482,8 @@ class Joystick(eros_base.erosEnv):
         * self._config.noise_config.scales.gyro
     )
 
-    gravity = data.site_xmat[self._site_id].T @ jp.array([0, 0, -1])
+    # --- Noisy gravity (up-vector projected through IMU rotation matrix) ---
+    gravity = data.site_xmat[self._imu_site_id].T @ jp.array([0, 0, -1])
     info["rng"], noise_rng = jax.random.split(info["rng"])
     noisy_gravity = (
         gravity
@@ -361,7 +492,10 @@ class Joystick(eros_base.erosEnv):
         * self._config.noise_config.scales.gravity
     )
 
-    joint_angles = data.qpos[7:]
+    # --- Noisy leg joint angles (12 DOF, in actuator order) ---
+    # Use _leg_qpos_adr so we read the CORRECT slots regardless of body-tree
+    # ordering (leg joints start at qpos[15], not qpos[7], in the EROS model).
+    joint_angles = data.qpos[self._leg_qpos_adr]
     info["rng"], noise_rng = jax.random.split(info["rng"])
     noisy_joint_angles = (
         joint_angles
@@ -370,7 +504,8 @@ class Joystick(eros_base.erosEnv):
         * self._qpos_noise_scale
     )
 
-    joint_vel = data.qvel[6:]
+    # --- Noisy leg joint velocities (12 DOF, in actuator order) ---
+    joint_vel = data.qvel[self._leg_dof_adr]
     info["rng"], noise_rng = jax.random.split(info["rng"])
     noisy_joint_vel = (
         joint_vel
@@ -379,10 +514,7 @@ class Joystick(eros_base.erosEnv):
         * self._config.noise_config.scales.joint_vel
     )
 
-    cos = jp.cos(info["phase"])
-    sin = jp.sin(info["phase"])
-    phase = jp.concatenate([cos, sin])
-
+    # --- Noisy local linear velocity (from velocimeter) ---
     linvel = self.get_local_linvel(data)
     info["rng"], noise_rng = jax.random.split(info["rng"])
     noisy_linvel = (
@@ -392,41 +524,53 @@ class Joystick(eros_base.erosEnv):
         * self._config.noise_config.scales.linvel
     )
 
-    state = jp.hstack([
-        noisy_gyro,  # 3
-        noisy_gravity,  # 3
-        info["command"],  # 3
-        noisy_joint_angles - self._default_pose,  # 12
-        noisy_joint_vel,  # 12
-        info["last_act"],  # 12
-        phase,
-    ])
+    # --- Gait phase (cos/sin of each leg phase) ---
+    cos = jp.cos(info["phase"])
+    sin = jp.sin(info["phase"])
+    phase = jp.concatenate([cos, sin])  # shape (4,)
 
+    # ---- Policy-visible state (no privileged info) -------------------------
+    state = jp.hstack([
+        noisy_gyro,                             # 3
+        noisy_gravity,                          # 3
+        info["command"],                        # 3
+        noisy_joint_angles - self._default_pose,  # 12
+        noisy_joint_vel,                        # 12
+        info["last_act"],                       # 12
+        phase,                                  # 4
+    ])  # total: 49
+
+    # ---- Privileged / teacher state ----------------------------------------
     accelerometer = self.get_accelerometer(data)
     global_angvel = self.get_global_angvel(data)
-    feet_vel = data.sensordata[self._foot_linvel_sensor_adr].ravel()
     root_height = data.qpos[2]
+    foot_pos = data.site_xpos[self._feet_site_id]
+    foot_height = foot_pos[..., -1]  # z-coordinate of each foot site
 
     privileged_state = jp.hstack([
         state,
-        gyro,  # 3
-        accelerometer,  # 3
-        gravity,  # 3
-        linvel,  # 3
-        global_angvel,  # 3
-        joint_angles - self._default_pose,
-        joint_vel,
-        root_height,  # 1
-        data.actuator_force,  # 12
-        contact,  # 2
-        feet_vel,  # 4*3
-        info["feet_air_time"],  # 2
-    ])
+        gyro,                                   # 3  (clean)
+        accelerometer,                          # 3
+        gravity,                                # 3  (clean)
+        linvel,                                 # 3  (clean)
+        global_angvel,                          # 3
+        joint_angles - self._default_pose,      # 12 (clean)
+        joint_vel,                              # 12 (clean)
+        root_height,                            # 1
+        data.actuator_force[:consts.NUM_LEG_DOFS],  # 12
+        contact,                                # 2
+        info["feet_air_time"],                  # 2
+        foot_height,                            # 2
+    ])  # total: 49 + 3+3+3+3+3+12+12+1+12+2+2+2 = 109
 
     return {
         "state": state,
         "privileged_state": privileged_state,
     }
+
+  # -------------------------------------------------------------------------
+  # Reward
+  # -------------------------------------------------------------------------
 
   def _get_reward(
       self,
@@ -447,69 +591,89 @@ class Joystick(eros_base.erosEnv):
         "tracking_ang_vel": self._reward_tracking_ang_vel(
             info["command"], self.get_gyro(data)
         ),
-        # Base-related rewards.
+        # Base-state rewards.
         "lin_vel_z": self._cost_lin_vel_z(self.get_global_linvel(data)),
         "ang_vel_xy": self._cost_ang_vel_xy(self.get_global_angvel(data)),
         "orientation": self._cost_orientation(self.get_gravity(data)),
         "base_height": self._cost_base_height(data.qpos[2]),
-        # Energy related rewards.
-        "torques": self._cost_torques(data.actuator_force),
+        # Energy rewards.
+        "torques": self._cost_torques(
+            data.actuator_force[:consts.NUM_LEG_DOFS]
+        ),
         "action_rate": self._cost_action_rate(
             action, info["last_act"], info["last_last_act"]
         ),
-        "energy": self._cost_energy(data.qvel[6:], data.actuator_force),
-        # Feet related rewards.
-        "feet_slip": self._cost_feet_slip(data, contact, info),
-        "feet_clearance": self._cost_feet_clearance(data, info),
-        "feet_height": self._cost_feet_height(
-            info["swing_peak"], first_contact, info
-        ),
+        "energy": self._cost_energy(data.qvel[self._leg_dof_adr],
+                                    data.actuator_force[:consts.NUM_LEG_DOFS]),
+        # Foot rewards (geometry/contact-based; no foot-velocity sensors).
         "feet_air_time": self._reward_feet_air_time(
             info["feet_air_time"], first_contact, info["command"]
         ),
+        "feet_slip": self._cost_feet_slip(data, contact),
+        # Phase / clearance rewards (disabled by default; sensors absent).
+        "feet_clearance": jp.zeros(()),
+        "feet_height": jp.zeros(()),
         "feet_phase": self._reward_feet_phase(
-            data,
-            info["phase"],
-            self._config.reward_config.max_foot_height,
-            info["command"],
+            data, info["phase"], self._config.reward_config.max_foot_height, info["command"]
         ),
-        # Other rewards.
+        # Other.
         "alive": self._reward_alive(),
         "termination": self._cost_termination(done),
-        "stand_still": self._cost_stand_still(info["command"], data.qpos[7:]),
-        # Pose related rewards.
-        "joint_deviation_hip": self._cost_joint_deviation_hip(
-            data.qpos[7:], info["command"]
+        "stand_still": self._cost_stand_still(
+            info["command"], data.qpos[self._leg_qpos_adr]
         ),
-        "joint_deviation_knee": self._cost_joint_deviation_knee(data.qpos[7:]),
-        "dof_pos_limits": self._cost_joint_pos_limits(data.qpos[7:]),
-        "pose": self._cost_pose(data.qpos[7:]),
+        # Pose rewards.
+        "joint_deviation_hip": self._cost_joint_deviation_hip(
+            data.qpos[self._leg_qpos_adr], info["command"]
+        ),
+        "joint_deviation_knee": self._cost_joint_deviation_knee(
+            data.qpos[self._leg_qpos_adr]
+        ),
+        "dof_pos_limits": self._cost_joint_pos_limits(data.qpos[self._leg_qpos_adr]),
+        "pose": self._cost_pose(data.qpos[self._leg_qpos_adr]),
     }
 
-  # Tracking rewards.
+  # -------------------------------------------------------------------------
+  # Tracking rewards
+  # -------------------------------------------------------------------------
 
   def _reward_tracking_lin_vel(
-      self,
-      commands: jax.Array,
-      local_vel: jax.Array,
+      self, commands: jax.Array, local_vel: jax.Array
   ) -> jax.Array:
     lin_vel_error = jp.sum(jp.square(commands[:2] - local_vel[:2]))
     return jp.exp(-lin_vel_error / self._config.reward_config.tracking_sigma)
 
   def _reward_tracking_ang_vel(
-      self,
-      commands: jax.Array,
-      ang_vel: jax.Array,
+      self, commands: jax.Array, ang_vel: jax.Array
   ) -> jax.Array:
     ang_vel_error = jp.square(commands[2] - ang_vel[2])
     return jp.exp(-ang_vel_error / self._config.reward_config.tracking_sigma)
 
-  # Base-related rewards.
+  # -------------------------------------------------------------------------
+  # Base-state costs
+  # -------------------------------------------------------------------------
 
-  def _cost_lin_vel_z(self, global_linvel) -> jax.Array:
+  def _reward_feet_phase(
+      self,
+      data: mjx.Data,
+      phase: jax.Array,
+      foot_height: jax.Array,
+      commands: jax.Array,
+  ) -> jax.Array:
+    # Reward for tracking the desired foot height.
+    del commands  # Unused.
+    foot_pos = data.site_xpos[self._feet_site_id]
+    foot_z = foot_pos[..., -1]
+    rz = gait.get_rz(phase, swing_height=foot_height)
+    error = jp.sum(jp.square(foot_z - rz))
+    reward = jp.exp(-error / 0.01)
+    return reward
+
+
+  def _cost_lin_vel_z(self, global_linvel: jax.Array) -> jax.Array:
     return jp.square(global_linvel[2])
 
-  def _cost_ang_vel_xy(self, global_angvel) -> jax.Array:
+  def _cost_ang_vel_xy(self, global_angvel: jax.Array) -> jax.Array:
     return jp.sum(jp.square(global_angvel[:2]))
 
   def _cost_orientation(self, torso_zaxis: jax.Array) -> jax.Array:
@@ -520,7 +684,9 @@ class Joystick(eros_base.erosEnv):
         base_height - self._config.reward_config.base_height_target
     )
 
-  # Energy related rewards.
+  # -------------------------------------------------------------------------
+  # Energy costs
+  # -------------------------------------------------------------------------
 
   def _cost_torques(self, torques: jax.Array) -> jax.Array:
     return jp.sum(jp.abs(torques))
@@ -534,10 +700,11 @@ class Joystick(eros_base.erosEnv):
       self, act: jax.Array, last_act: jax.Array, last_last_act: jax.Array
   ) -> jax.Array:
     del last_last_act  # Unused.
-    c1 = jp.sum(jp.square(act - last_act))
-    return c1
+    return jp.sum(jp.square(act - last_act))
 
-  # Other rewards.
+  # -------------------------------------------------------------------------
+  # Other costs / rewards
+  # -------------------------------------------------------------------------
 
   def _cost_joint_pos_limits(self, qpos: jax.Array) -> jax.Array:
     out_of_limits = -jp.clip(qpos - self._soft_lowers, None, 0.0)
@@ -545,9 +712,7 @@ class Joystick(eros_base.erosEnv):
     return jp.sum(out_of_limits)
 
   def _cost_stand_still(
-      self,
-      commands: jax.Array,
-      qpos: jax.Array,
+      self, commands: jax.Array, qpos: jax.Array
   ) -> jax.Array:
     cmd_norm = jp.linalg.norm(commands)
     return jp.sum(jp.abs(qpos - self._default_pose)) * (cmd_norm < 0.1)
@@ -558,7 +723,9 @@ class Joystick(eros_base.erosEnv):
   def _reward_alive(self) -> jax.Array:
     return jp.array(1.0)
 
-  # Pose-related rewards.
+  # -------------------------------------------------------------------------
+  # Pose costs
+  # -------------------------------------------------------------------------
 
   def _cost_joint_deviation_hip(
       self, qpos: jax.Array, cmd: jax.Array
@@ -579,37 +746,16 @@ class Joystick(eros_base.erosEnv):
   def _cost_pose(self, qpos: jax.Array) -> jax.Array:
     return jp.sum(jp.square(qpos - self._default_pose) * self._weights)
 
-  # Feet related rewards.
+  # -------------------------------------------------------------------------
+  # Foot rewards (geometry / contact-based; no foot-velocity sensors needed)
+  # -------------------------------------------------------------------------
 
   def _cost_feet_slip(
-      self, data: mjx.Data, contact: jax.Array, info: dict[str, Any]
+      self, data: mjx.Data, contact: jax.Array
   ) -> jax.Array:
-    del info  # Unused.
+    """Penalise horizontal base velocity when a foot is in contact."""
     body_vel = self.get_global_linvel(data)[:2]
-    reward = jp.sum(jp.linalg.norm(body_vel, axis=-1) * contact)
-    return reward
-
-  def _cost_feet_clearance(
-      self, data: mjx.Data, info: dict[str, Any]
-  ) -> jax.Array:
-    del info  # Unused.
-    feet_vel = data.sensordata[self._foot_linvel_sensor_adr]
-    vel_xy = feet_vel[..., :2]
-    vel_norm = jp.sqrt(jp.linalg.norm(vel_xy, axis=-1))
-    foot_pos = data.site_xpos[self._feet_site_id]
-    foot_z = foot_pos[..., -1]
-    delta = jp.abs(foot_z - self._config.reward_config.max_foot_height)
-    return jp.sum(delta * vel_norm)
-
-  def _cost_feet_height(
-      self,
-      swing_peak: jax.Array,
-      first_contact: jax.Array,
-      info: dict[str, Any],
-  ) -> jax.Array:
-    del info  # Unused.
-    error = swing_peak / self._config.reward_config.max_foot_height - 1.0
-    return jp.sum(jp.square(error) * first_contact)
+    return jp.sum(jp.linalg.norm(body_vel, axis=-1) * contact)
 
   def _reward_feet_air_time(
       self,
@@ -626,33 +772,22 @@ class Joystick(eros_base.erosEnv):
     reward *= cmd_norm > 0.1  # No reward for zero commands.
     return reward
 
-  def _reward_feet_phase(
-      self,
-      data: mjx.Data,
-      phase: jax.Array,
-      foot_height: jax.Array,
-      commands: jax.Array,
-  ) -> jax.Array:
-    # Reward for tracking the desired foot height.
-    del commands  # Unused.
-    foot_pos = data.site_xpos[self._feet_site_id]
-    foot_z = foot_pos[..., -1]
-    rz = gait.get_rz(phase, swing_height=foot_height)
-    error = jp.sum(jp.square(foot_z - rz))
-    reward = jp.exp(-error / 0.01)
-    # TODO(kevin): Ensure no movement at 0 command.
-    # cmd_norm = jp.linalg.norm(commands)
-    # reward *= cmd_norm > 0.1  # No reward for zero commands.
-    return reward
+  # -------------------------------------------------------------------------
+  # Command sampling
+  # -------------------------------------------------------------------------
 
   def sample_command(self, rng: jax.Array) -> jax.Array:
     rng1, rng2, rng3, rng4 = jax.random.split(rng, 4)
 
     lin_vel_x = jax.random.uniform(
-        rng1, minval=self._config.lin_vel_x[0], maxval=self._config.lin_vel_x[1]
+        rng1,
+        minval=self._config.lin_vel_x[0],
+        maxval=self._config.lin_vel_x[1],
     )
     lin_vel_y = jax.random.uniform(
-        rng2, minval=self._config.lin_vel_y[0], maxval=self._config.lin_vel_y[1]
+        rng2,
+        minval=self._config.lin_vel_y[0],
+        maxval=self._config.lin_vel_y[1],
     )
     ang_vel_yaw = jax.random.uniform(
         rng3,
@@ -660,7 +795,7 @@ class Joystick(eros_base.erosEnv):
         maxval=self._config.ang_vel_yaw[1],
     )
 
-    # With 10% chance, set everything to zero.
+    # With 10% chance, send a zero command (stand still).
     return jp.where(
         jax.random.bernoulli(rng4, p=0.1),
         jp.zeros(3),
