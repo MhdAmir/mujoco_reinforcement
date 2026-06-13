@@ -296,10 +296,7 @@ class Joystick(eros_base.ErosEnv):
     rng, key = jax.random.split(rng)
     gait_freq = jax.random.uniform(key, (1,), minval=1.25, maxval=1.5)
     phase_dt = 2 * jp.pi * self.dt * gait_freq
-    rng, key = jax.random.split(rng)
-    phase_offset = jax.random.uniform(key, minval=-jp.pi, maxval=jp.pi)
-    phase = jp.array([phase_offset, phase_offset + jp.pi])
-    phase = jp.fmod(phase + jp.pi, 2 * jp.pi) - jp.pi
+    phase = jp.array([0, jp.pi])
 
     rng, cmd_rng = jax.random.split(rng)
     cmd = self.sample_command(cmd_rng)
