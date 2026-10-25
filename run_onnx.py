@@ -29,7 +29,7 @@ from mujoco_playground._src import registry
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
-parser.add_argument("policy", nargs="?", default=os.path.join(ROOT, "eros_policy.onnx"))
+parser.add_argument("policy", nargs="?", default=os.path.join(ROOT, "eros_policy4.onnx"))
 parser.add_argument("env",    nargs="?", default="ErosJoystickFlatTerrain")
 parser.add_argument("--x",   type=float, default=0.0)
 parser.add_argument("--y",   type=float, default=-1.0)

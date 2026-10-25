@@ -1,12 +1,12 @@
 """
 Interactive EROS robot viewer.
-- Opens MuJoCo viewer with full ctrl sliders
-- Press R to reset to home keyframe pose
+- Opens MuJoCo viewer with full ctrl sliders (right panel -> Control tab)
+- Press R in viewer to reset to home keyframe pose
 - Press Space to pause/unpause simulation
-- Ctrl sliders: r_hip_yaw, r_hip_roll, r_hip_pitch, r_knee_pitch, r_ankle_pitch, r_ankle_roll,
-                l_hip_yaw, l_hip_roll, l_hip_pitch, l_knee_pitch, l_ankle_pitch, l_ankle_roll,
-                r_sh_pitch, r_sh_roll, r_elb_pitch, l_sh_pitch, l_sh_roll, l_elb_pitch, neck, head
-- Terminal prints base z and foot z every second so you can monitor standing height
+- IMU site is highlighted RED with an XYZ axis frame so you can see exactly
+  where it is and how it's oriented. Foot sites are highlighted GREEN.
+- Terminal shows a live-updating line with gyro / accel / gravity / linvel
+  read straight from the IMU sensors (same data the RL policy/real robot sees).
 """
 import sys, os, glob
 sys.path.insert(0, os.path.dirname(__file__))
@@ -49,20 +49,43 @@ for i in range(model.njnt):
     if jnt.name:
         print(f"  qpos[{jnt.qposadr}] = {jnt.name}")
 
+# ── Highlight IMU + foot sites so they're visible in the viewer ───────────────
+def highlight_site(name, size, rgba):
+    sid = model.site(name).id
+    model.site_size[sid] = size
+    model.site_rgba[sid] = rgba
+
+highlight_site('imu',    [0.018, 0.018, 0.018], [1.0, 0.0, 0.0, 1.0])  # red ball
+highlight_site('r_foot', [0.012, 0.012, 0.012], [0.0, 1.0, 0.0, 1.0])  # green ball
+highlight_site('l_foot', [0.012, 0.012, 0.012], [0.0, 1.0, 0.0, 1.0])  # green ball
+
+imu_site_id = model.site('imu').id
+print(f"\nIMU site id={imu_site_id}  local pos (relative to base_link) = {model.site_pos[imu_site_id]}")
+
+# ── Sensor helper: read by name regardless of ordering in XML ─────────────────
+def sensor(name):
+    sid = model.sensor(name).id
+    adr = model.sensor_adr[sid]
+    dim = model.sensor_dim[sid]
+    return data.sensordata[adr:adr + dim]
+
 # Reset to home keyframe
 key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, 'home')
 mujoco.mj_resetDataKeyframe(model, data, key_id)
 mujoco.mj_forward(model, data)
 
-last_print = time.time()
 r_foot_geom = model.geom('r_ankle_roll_geom').id
 l_foot_geom = model.geom('l_ankle_roll_geom').id
 
 def get_foot_z(geom_id):
     return data.geom_xpos[geom_id][2] - model.geom_size[geom_id][2]
 
-print("\nViewer opened. Use ctrl sliders on the right panel to tune joint positions.")
+print("\nViewer opened. Use ctrl sliders (right panel -> Control) to tune joint positions.")
+print("RED ball = IMU location. GREEN balls = foot sites.")
 print("Press R in viewer to reset to home keyframe.\n")
+
+last_print = 0.0
+PRINT_HZ = 10.0  # live IMU readout refresh rate
 
 with mujoco.viewer.launch_passive(model, data) as viewer:
     # set camera
@@ -71,20 +94,34 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
     viewer.cam.distance = 1.8
     viewer.cam.lookat[:] = [0.1, 0.077, 0.2]
 
+    # Sites are visible by default (group 0). Show XYZ axis frames at each site
+    # too, so IMU orientation is visible.
+    viewer.opt.sitegroup[:] = 1
+    viewer.opt.frame = mujoco.mjtFrame.mjFRAME_SITE
+
     while viewer.is_running():
         step_start = time.time()
         mujoco.mj_step(model, data)
         viewer.sync()
 
         now = time.time()
-        if now - last_print >= 1.0:
-            r_fz = get_foot_z(r_foot_geom)
-            l_fz = get_foot_z(l_foot_geom)
+        if now - last_print >= 1.0 / PRINT_HZ:
+            gyro    = sensor('gyro')           # rad/s
+            accel   = sensor('accelerometer')  # m/s^2
+            linvel  = sensor('local_linvel')   # m/s (IMU frame)
+            upvec   = sensor('upvector')       # gravity-aligned "up" in IMU frame
+            r_fz, l_fz = get_foot_z(r_foot_geom), get_foot_z(l_foot_geom)
             bz = data.qpos[2]
-            by = data.qpos[1]
-            print(f"base_z={bz:+.4f}  r_foot_z={r_fz:+.4f}  l_foot_z={l_fz:+.4f}  base_y={by:+.4f}")
-            print(f"  ctrl: r_hp={data.ctrl[2]:.3f} r_kn={data.ctrl[3]:.3f} r_ak={data.ctrl[4]:.3f} "
-                  f"l_hp={data.ctrl[8]:.3f} l_kn={data.ctrl[9]:.3f} l_ak={data.ctrl[10]:.3f}")
+
+            line = (
+                f"\rt={data.time:6.2f}s  base_z={bz:+.3f}  foot(r,l)=({r_fz:+.3f},{l_fz:+.3f})  "
+                f"GYRO=({gyro[0]:+.2f},{gyro[1]:+.2f},{gyro[2]:+.2f})  "
+                f"ACCEL=({accel[0]:+.2f},{accel[1]:+.2f},{accel[2]:+.2f})  "
+                f"LINVEL=({linvel[0]:+.2f},{linvel[1]:+.2f},{linvel[2]:+.2f})  "
+                f"UP=({upvec[0]:+.2f},{upvec[1]:+.2f},{upvec[2]:+.2f})   "
+            )
+            sys.stdout.write(line)
+            sys.stdout.flush()
             last_print = now
 
         elapsed = time.time() - step_start
